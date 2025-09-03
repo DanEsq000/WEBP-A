@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Captura cámara → WebP animado</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 1rem;
+      text-align: center;
+    }
+
+    video,
+    img {
+      max-width: 100%;
+      border-radius: 12px;
+      margin: 0.5rem 0;
+    }
+
+    button,
+    select {
+      padding: 0.6rem 1rem;
+      margin: 0.5rem;
+      border-radius: 8px;
+      border: none;
+      font-size: 1rem;
+      background: #007bff;
+      color: white;
+    }
+
+    button:disabled {
+      background: #aaa;
+    }
+
+    #controls {
+      margin: 1rem 0;
+    }
+
+    #timer {
+      font-size: 1.2rem;
+      font-weight: bold;
+      margin-top: 0.5rem;
+    }
+
+    #processing {
+      font-size: 1.1rem;
+      font-weight: bold;
+      color: #ff6600;
+      margin-top: 0.5rem;
+      display: none;
+    }
+
+    #errors {
+      color: red;
+      font-weight: bold;
+      margin-top: 0.5rem;
+    }
+
+    #progress {
+      width: 100%;
+      max-width: 400px;
+      margin: 0.5rem auto;
+      height: 20px;
+      background: #eee;
+      border-radius: 10px;
+      overflow: hidden;
+      display: none;
+    }
+
+    #progress-bar {
+      height: 100%;
+      width: 0%;
+      background: #28a745;
+      transition: width 0.3s;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Captura cámara → WebP animado</h2>
+
+  <div id="errors"></div>
+
+  <label for="cameraSelect">Seleccionar cámara:</label>
+  <select id="cameraSelect"></select>
+
+  <div id="preview">
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div id="controls">
+    <button id="start">🎬 Iniciar</button>
+    <button id="stop" disabled>⏹️ Detener</button>
+    <div id="timer">⏱ 00:00</div>
+    <div id="processing">⏳ Procesando animación...</div>
+    <div id="progress">
+      <div id="progress-bar"></div>
+    </div>
+  </div>
+
+  <div id="output"></div>
+  <a id="download" hidden>⬇ Descargar WebP</a>
+
+  <script>
+    let frames = [];
+    let interval, timerInterval, secondsElapsed = 0;
+    let currentStream = null;
+
+    const video = document.getElementById("video");
+    const select = document.getElementById("cameraSelect");
+    const btnStart = document.getElementById("start");
+    const btnStop = document.getElementById("stop");
+    const output = document.getElementById("output");
+    const linkDownload = document.getElementById("download");
+    const timer = document.getElementById("timer");
+    const processing = document.getElementById("processing");
+    const errorsDiv = document.getElementById("errors");
+    const progress = document.getElementById("progress");
+    const progressBar = document.getElementById("progress-bar");
+
+    // Formatea tiempo mm:ss
+    function formatTime(seconds) {
+      const m = String(Math.floor(seconds / 60)).padStart(2, "0");
+      const s = String(seconds % 60).padStart(2, "0");
+      return `${m}:${s}`;
+    }
+
+    // Manejo global de errores
+    window.addEventListener("error", event => errorsDiv.textContent = `❌ Error JS: ${event.message}`);
+    window.addEventListener("unhandledrejection", event => errorsDiv.textContent = `❌ Error de promesa: ${event.reason}`);
+
+    // Pide permiso de cámara antes de listar
+    async function ensurePermission() {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      stream.getTracks().forEach(track => track.stop());
+    }
+
+    // Obtiene cámaras disponibles
+    async function getCameras() {
+      await ensurePermission();
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cameras = devices.filter(d => d.kind === "videoinput");
+      select.innerHTML = "";
+      cameras.sort((a, b) => a.label.localeCompare(b.label));
+      cameras.forEach((cam, i) => {
+        const option = document.createElement("option");
+        option.value = cam.deviceId;
+        option.text = cam.label || `Cámara ${i + 1}`;
+        select.appendChild(option);
+      });
+    }
+
+    // Inicia stream de la cámara seleccionada
+    async function startCamera(deviceId) {
+      if (currentStream) currentStream.getTracks().forEach(track => track.stop());
+      const constraints = deviceId
+        ? { video: { deviceId: { exact: deviceId } } }
+        : { video: { facingMode: "environment" } };
+      currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = currentStream;
+    }
+
+    select.addEventListener("change", e => startCamera(e.target.value));
+
+    // Inicializar cámaras al cargar
+    getCameras().then(() => {
+      if (select.options.length > 0) startCamera(select.options[0].value);
+    });
+
+    // Subida en lotes con progreso
+    async function sendInBatches(frames, batchSize = 50, concurrency = 4) {
+      const total = frames.length;
+      const batches = Math.ceil(total / batchSize);
+      let uploaded = 0;
+
+      const tasks = Array.from({ length: batches }, (_, b) => {
+        const start = b * batchSize;
+        const end = Math.min(start + batchSize, total);
+        const batch = frames.slice(start, end);
+
+        return async () => {
+          const formData = new FormData();
+          batch.forEach((f, i) => formData.append("frame", f, `frame${start + i}.webp`));
+          await fetch("/upload-batch", { method: "POST", body: formData });
+          uploaded += batch.length;
+          const percent = Math.round((uploaded / total) * 100);
+          progressBar.style.width = percent + "%";
+        };
+      });
+
+      let index = 0;
+      async function worker() {
+        while (index < tasks.length) {
+          const task = tasks[index++];
+          await task();
+        }
+      }
+
+      progress.style.display = "block";
+      progressBar.style.width = "0%";
+      await Promise.all(Array.from({ length: concurrency }, worker));
+      progress.style.display = "none";
+    }
+
+    // Iniciar captura
+    btnStart.onclick = () => {
+      frames = [];
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      output.innerHTML = "";
+      linkDownload.hidden = true;
+      secondsElapsed = 0;
+      timer.textContent = "⏱ 00:00";
+
+      timerInterval = setInterval(() => {
+        secondsElapsed++;
+        timer.textContent = "⏱ " + formatTime(secondsElapsed);
+      }, 1000);
+
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+
+      const fps = 15;
+      const cap = Math.round(1000 / fps);
+
+      interval = setInterval(() => {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0);
+        canvas.toBlob(blob => frames.push(blob), "image/webp", 8);
+      }, cap);
+    };
+
+    // Detener y enviar
+    btnStop.onclick = async () => {
+      clearInterval(interval);
+      clearInterval(timerInterval);
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+
+      processing.style.display = "block";
+      processing.textContent = `⏳ Preparando ${frames.length} frames...`;
+
+      try {
+        processing.textContent = `⏳ Enviando ${frames.length} frames...`;
+        await sendInBatches(frames, 50, 4);
+
+        processing.textContent = `⏳ Armando animación...`;
+        const response = await fetch("/finalize", { method: "POST" });
+
+        if (!response.ok) throw new Error(await response.text());
+
+        processing.textContent = `⏳ Descargando animación...`;
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+
+        const img = document.createElement("img");
+        img.src = url;
+        output.appendChild(img);
+
+        const duration = formatTime(secondsElapsed).replace(":", "-");
+        linkDownload.href = url;
+        linkDownload.download = `captura_${duration}.webp`;
+        linkDownload.hidden = false;
+
+      } catch (err) {
+        errorsDiv.textContent = `❌ ${err.message}`;
+      } finally {
+        processing.style.display = "none";
+        progress.style.display = "none";
+      }
+    };
+  </script>
+</body>
+
+</html>
